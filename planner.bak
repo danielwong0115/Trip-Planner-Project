@@ -1,0 +1,384 @@
+#lang dssl2
+
+# Trip Planner
+
+import cons
+import 'project-lib/dictionaries.rkt'
+import sbox_hash
+import 'project-lib/graph.rkt'
+import 'project-lib/binheap.rkt'
+
+### Basic Types ###
+
+#  - Latitudes and longitudes are numbers:
+let Lat?  = num?
+let Lon?  = num?
+
+#  - Point-of-interest categories and names are strings:
+let Cat?  = str?
+let Name? = str?
+
+### Raw Item Types ###
+
+#  - Raw positions are 2-element vectors with a latitude and a longitude
+let RawPos? = TupC[Lat?, Lon?]
+
+#  - Raw road segments are 4-element vectors with the latitude and
+#    longitude of their first endpoint, then the latitude and longitude
+#    of their second endpoint
+let RawSeg? = TupC[Lat?, Lon?, Lat?, Lon?]
+
+#  - Raw points-of-interest are 4-element vectors with a latitude, a
+#    longitude, a point-of-interest category, and a name
+let RawPOI? = TupC[Lat?, Lon?, Cat?, Name?]
+
+### Contract Helpers ###
+
+# ListC[T] is a list of `T`s (linear time):
+let ListC = Cons.ListC
+# List of unspecified element type (constant time):
+let List? = Cons.list?
+
+
+interface TRIP_PLANNER:
+
+    # Returns the positions of all the points-of-interest that belong to
+    # the given category.
+    def locate_all(
+            self,
+            dst_cat:  Cat?           # point-of-interest category
+        )   ->        ListC[RawPos?] # positions of the POIs
+
+    # Returns the shortest route, if any, from the given source position
+    # to the point-of-interest with the given name.
+    def plan_route(
+            self,
+            src_lat:  Lat?,          # starting latitude
+            src_lon:  Lon?,          # starting longitude
+            dst_name: Name?          # name of goal
+        )   ->        ListC[RawPos?] # path to goal
+
+    # Finds no more than `n` points-of-interest of the given category
+    # nearest to the source position.
+    def find_nearby(
+            self,
+            src_lat:  Lat?,          # starting latitude
+            src_lon:  Lon?,          # starting longitude
+            dst_cat:  Cat?,          # point-of-interest category
+            n:        nat?           # maximum number of results
+        )   ->        ListC[RawPOI?] # list of nearby POIs
+
+
+class TripPlanner (TRIP_PLANNER):
+    let category_dict
+    let name_dict
+    let pos_dict
+    let vtx_dict
+    let pos_to_poi
+    let WUgraph
+    def __init__(self, raw_road, raw_poi):
+        self.category_dict = HashTable(raw_poi.len(), make_sbox_hash())
+        for s in raw_poi:
+            if self.category_dict.mem?(s[2]) == True:
+                let pointer = self.category_dict.get(s[2])
+                while not pointer == None:
+                    if pointer.data == [s[0], s[1]]:
+                        break
+                    elif pointer.next == None:
+                        self.category_dict.put(s[2], cons([s[0], s[1]], self.category_dict.get(s[2])))
+                    pointer = pointer.next
+            else:
+                self.category_dict.put(s[2], cons([s[0], s[1]], None))
+                
+                
+        self.name_dict = HashTable(raw_poi.len(), make_sbox_hash())
+        for q in raw_poi:
+            self.name_dict.put(q[3], [q[0], q[1]])
+            
+                
+        self.pos_dict = HashTable((2*raw_road.len()), make_sbox_hash())
+        let k = 0
+        for n in raw_road:
+            if self.pos_dict.mem?([n[0], n[1]]) == False:
+                self.pos_dict.put([n[0], n[1]], k)
+                k = k + 1
+                if self.pos_dict.mem?([n[2], n[3]]) == False:
+                    self.pos_dict.put([n[2], n[3]], k)
+                    k = k + 1
+            else:
+                if self.pos_dict.mem?([n[2], n[3]]) == False:
+                    self.pos_dict.put([n[2], n[3]], k)
+                    k = k + 1
+                    
+                    
+        self.vtx_dict = [None; self.pos_dict.len()]
+        for w in raw_road:
+            self.vtx_dict[self.pos_dict.get([w[0], w[1]])] = [w[0], w[1]]
+            self.vtx_dict[self.pos_dict.get([w[2], w[3]])] = [w[2], w[3]]
+            
+            
+        self.pos_to_poi = HashTable(raw_poi.len(), make_sbox_hash())
+        for b in raw_poi:
+            if self.pos_to_poi.mem?([b[0], b[1]]) == True:
+                self.pos_to_poi.put([b[0], b[1]], cons(b, self.pos_to_poi.get([b[0], b[1]])))
+            else:
+                self.pos_to_poi.put([b[0], b[1]], cons(b, None))
+                
+                
+        self.WUgraph = WUGraph(self.pos_dict.len())
+        for u in raw_road:
+            let dx = u[2] - u[0]
+            let dy = u[3] - u[1]
+            self.WUgraph.set_edge(self.pos_dict.get([u[0], u[1]]), self.pos_dict.get([u[2], u[3]]), (dx*dx + dy*dy).sqrt()) 
+                
+    def locate_all(self, dst_cat):
+        if self.category_dict.mem?(dst_cat) == False:
+            return None
+        else:
+            let result = self.category_dict.get(dst_cat)
+            return result
+        
+    def plan_route(self, src_lat, src_lon, dst_name):
+        if self.name_dict.mem?(dst_name) == False:
+            return None
+        elif [src_lat, src_lon] == self.name_dict.get(dst_name):
+            return cons([src_lat, src_lon], None)
+        else:
+            let dist_and_pred = self.dijkstra(self.pos_dict.get([src_lat, src_lon]))
+            if dist_and_pred[1][self.pos_dict.get(self.name_dict.get(dst_name))] == None:
+                return None
+            else:
+                let path = None
+                let curr = self.pos_dict.get(self.name_dict.get(dst_name))
+                while curr != None:
+                    path = cons(self.vtx_dict[curr], path)
+                    curr = dist_and_pred[1][curr]
+                return path
+        
+        
+    def find_nearby(self, src_lat, src_lon, dst_cat, n):
+        if self.category_dict.mem?(dst_cat) == False:
+            return None
+        else:
+            let dists_and_preds = self.dijkstra(self.pos_dict.get([src_lat, src_lon]))
+            let nearest_cats = BinHeap(self.WUgraph.len(), λ x, y: x[1] < y[1])
+            for i in range(dists_and_preds[0].len()):
+                if dists_and_preds[0][i] == inf:
+                    continue
+                else:
+                    nearest_cats.insert([i, dists_and_preds[0][i]])
+            let counter = n
+            let result = None
+            while not counter == 0:
+                if nearest_cats.len() == 0:
+                    break
+                else:
+                    let nearest_cat_poi = nearest_cats.find_min()[0]
+                    nearest_cats.remove_min()
+                    if self.pos_to_poi.mem?(self.vtx_dict[nearest_cat_poi]) == True:
+                        let curr_poi = self.pos_to_poi.get(self.vtx_dict[nearest_cat_poi])
+                        while not curr_poi == None:
+                            if counter != 0:
+                                if curr_poi.data[2] == dst_cat:
+                                    result = cons(curr_poi.data, result)
+                                    counter = counter - 1
+                                    curr_poi = curr_poi.next
+                                else:
+                                    curr_poi = curr_poi.next
+                            else:
+                                break
+            return result
+            
+             
+    def dijkstra(self, v):
+        def compare_dist(x, y):
+            if x[1] < y[1]:
+                return True
+            else:
+                return False
+        let dist = [inf; self.pos_dict.len()]
+        let pred = [None; self.pos_dict.len()]
+        dist[v] = 0
+        let todo = BinHeap(self.WUgraph.len()*self.WUgraph.len(), compare_dist)
+        let done = [0; self.pos_dict.len()]
+        todo.insert([v, 0])
+        while not todo.len() == 0:
+            let nearest = todo.find_min()[0]
+            todo.remove_min()
+            if done[nearest] == 0:
+                done[nearest] = 1
+                let pointer = self.WUgraph.get_adjacent(nearest)
+                while not pointer == None:
+                    if dist[nearest] + self.WUgraph.get_edge(nearest, pointer.data) < dist[pointer.data]:
+                        dist[pointer.data] = dist[nearest] + self.WUgraph.get_edge(nearest, pointer.data)
+                        pred[pointer.data] = nearest
+                        todo.insert([pointer.data, dist[pointer.data]])
+                        pointer = pointer.next
+                    else:
+                        pointer = pointer.next
+                        
+        return [dist, pred]
+        
+        
+
+
+def my_first_example():
+    return TripPlanner([[0,0, 0,1], [0,0, 1,0]],
+                       [[0,0, "bar", "The Empty Bottle"],
+                        [0,1, "food", "Pierogi"]])
+                        
+def my_second_example():
+    return TripPlanner([[0,0, 0,-1], [-0.2,0.7, 0,1.5], [0,0, -0.05,-1.4], [1,0, 1,-1], [1,-1, 0,-1], [0.3,0.9, 0,1.5], [4,-1, 3,-1], [1,-1, 0,0], [0.3,0.9, 0,0], [-0.05,-1.4, 0,-1], [0,0, -0.2,0.7], [1,1, 1,0]],
+                       [[0,0, "store", "Target"],
+                        [0,-1, "health", "Gym"],
+                        [1,-1, "food", "Sbarro"],
+                        [1,1, "food", "Starbucks"],
+                        [-0.2,0.7, "theater", "Cinema 21"],
+                        [0,1.5, "food", "Marina Cafe"],
+                        [1,1, "station", "Gateway"],
+                        [0,0, "food", "Buranko"],
+                        [-0.05,-1.4, "food", "Cajun Grill"],
+                        [0.3,0.9, "health", "Dentist"],
+                        [0,0, "food", "Afuri"],
+                        [3,-1, "park", "Waterfront Park"],
+                        [-0.2,0.7, "store", "Costco"],
+                        [1,1, "school", "DD Scots"],
+                        [0,0, "food", "Meet Fresh"],
+                        [0.3,0.9, "store", "Whole Foods"],
+                        [-0.05,-1.4, "government", "Police Station"],
+                        [0,0, "food", "Montes"],
+                        [0,1.5, "government", "Fire Station"],
+                        [3,-1, "government", "Park Ranger"],
+                        [0,-1, "station", "Main Street"],
+                        [1,-1, "school", "Cherry Chargers"],
+                        [0,0, "government", "City Hall"],
+                        [4,-1, "government", "Lighthouse"],
+                        [0,-1, "health", "Hospital"]])
+                        
+def my_third_example():
+    return TripPlanner([[9.5,-15, 4.5,-11], [-0.5,0, -0.5,-7], [9.5,0, 9.5,15], [-0.5,7, -0.5,0], [-0.5,-7, 4.5,-11], [9.5,-15, 9.5,0], [-0.5,7, 4.5,11], [9.5,15, 4.5,11]],
+                       [[-0.5,-7, "hiking", "West River Trail"],
+                        [9.5,15, "equipment", "Camping Shop"],
+                        [9.5,0, "information", "Map 2"],
+                        [9.5,-15, "hiking", "West Entrance"],
+                        [-0.5,7, "hiking", "East River Trail"],
+                        [-0.5,0, "camping", "Checkpoint 4"],
+                        [9.5,-15, "information", "Map 1"],
+                        [9.5,15, "hiking", "East Entrance"],
+                        [-0.5,7, "camping", "Checkpoint 3"],
+                        [9.5,-15, "equipment", "Hiking Shop"],
+                        [9.5,0, "scenic point", "Vista House"],
+                        [9.5,15, "information", "Map 3"],
+                        [-0.5,-7, "camping", "Checkpoint 2"],
+                        [-0.5,0, "fishing", "Waterfall"],
+                        [9.5,-15, "information", "West Visitor Center"],
+                        [9.5,0, "camping", "Checkpoint 1"],
+                        [9.5,15, "information", "East Visitor Center"]])
+                        
+                        
+
+test 'My first locate_all test':
+    assert my_first_example().locate_all("food") == \
+        cons([0,1], None)
+
+test 'My first plan_route test':
+   assert my_first_example().plan_route(0, 0, "Pierogi") == \
+       cons([0,0], cons([0,1], None))
+
+test 'My first find_nearby test':
+    assert my_first_example().find_nearby(0, 0, "food", 1) == \
+        cons([0,1, "food", "Pierogi"], None)
+        
+test 'My second locate_all test':
+    assert my_second_example().locate_all("bank") == None
+    assert my_second_example().locate_all("food") == cons([-0.05,-1.4], cons([0,0], cons([0,1.5], cons([1,1], cons([1,-1], None)))))
+    assert my_second_example().locate_all("theater") == cons([-0.2,0.7], None)
+    assert my_second_example().locate_all("park") == cons([3,-1], None)
+    assert my_second_example().locate_all("health") == cons([0.3, 0.9], cons([0,-1], None))
+    
+test 'My second plan_route test':
+    assert my_second_example().plan_route(0, 0, "Police Station") == cons([0,0], cons([-0.05,-1.4], None))
+    assert my_second_example().plan_route(0, 1.5, "Starbucks") == cons([0,1.5], cons([-0.2, 0.7], cons([0,0], cons([1,-1], cons([1,0], cons([1,1], None))))))
+    assert my_second_example().plan_route(0, 1.5, "Starbucks") == my_second_example().plan_route(0, 1.5, "DD Scots")
+    assert my_second_example().plan_route(0.3,0.9, "Dentist") == cons([0.3,0.9], None)
+    assert my_second_example().plan_route(0, 0, "Sbarro") == cons([0,0], cons([1,-1], None))
+    assert my_second_example().plan_route(-0.2,0.7, "Jamba Juice") == None
+    assert my_second_example().plan_route(-0.05,-1.4, "Park Ranger") == None
+    assert my_second_example().plan_route(4,-1, "Park Ranger") == cons([4,-1], cons([3,-1], None))
+    assert my_second_example().plan_route(4,-1, "Cherry Chargers") == None
+    assert my_second_example().plan_route(0.3,0.9, "Cherry Chargers") == cons([0.3,0.9], cons([0,0], cons([1,-1], None)))
+    assert my_second_example().plan_route(-0.05,-1.4, "Fire Station") == cons([-0.05,-1.4], cons([0,0], cons([-0.2,0.7], cons([0,1.5], None))))
+    assert my_second_example().plan_route(-0.2,0.7, "Whole Foods") == cons([-0.2,0.7], cons([0,1.5], cons([0.3,0.9], None)))
+    
+test 'My second find_nearby test':
+    let my_small_town = my_second_example()
+    assert my_small_town.find_nearby(1,0, "theater", 1) == cons([-0.2,0.7, "theater", "Cinema 21"], None)
+    assert my_small_town.find_nearby(1,0, "theater", 1) == cons([-0.2,0.7, "theater", "Cinema 21"], None)
+    assert my_small_town.find_nearby(0,0, "government", 5) == cons([0,1.5, "government", "Fire Station"], cons([-0.05,-1.4, "government", "Police Station"], cons([0,0, "government", "City Hall"], None)))
+    assert my_small_town.find_nearby(0,0, "government", 5) == cons([0,1.5, "government", "Fire Station"], cons([-0.05,-1.4, "government", "Police Station"], cons([0,0, "government", "City Hall"], None)))
+    assert my_small_town.find_nearby(0,-1, "hotel", 15) == None
+    assert my_small_town.find_nearby(-0.2,0.7, "park", 7) == None
+    assert my_small_town.find_nearby(3,-1, "station", 6) == None
+    assert my_small_town.find_nearby(0,0, "food", 7) == cons([0,1.5, "food", "Marina Cafe"], cons([1,-1, "food", "Sbarro"], cons([-0.05,-1.4, "food", "Cajun Grill"], cons([0,0, "food", "Buranko"], cons([0,0, "food", "Afuri"], cons([0,0, "food", "Meet Fresh"], cons([0,0, "food", "Montes"], None)))))))
+    assert my_small_town.find_nearby(0,-1, "food", 4) == cons([0,0, "food", "Afuri"], cons([0,0, "food", "Meet Fresh"], cons([0,0, "food", "Montes"], cons([-0.05,-1.4, "food", "Cajun Grill"], None))))
+    assert my_small_town.find_nearby(0,-1, "food", 4) == cons([0,0, "food", "Afuri"], cons([0,0, "food", "Meet Fresh"], cons([0,0, "food", "Montes"], cons([-0.05,-1.4, "food", "Cajun Grill"], None))))
+    assert my_small_town.find_nearby(1,0, "food", 9) == cons([0,1.5, "food", "Marina Cafe"], cons([0,0, "food", "Buranko"], cons([0,0, "food", "Afuri"], cons([0,0, "food", "Meet Fresh"], cons([0,0, "food", "Montes"], cons([-0.05,-1.4, "food", "Cajun Grill"], cons([1,-1, "food", "Sbarro"], cons([1,1, "food", "Starbucks"], None))))))))
+    assert my_small_town.find_nearby(1,0, "food", 9) == cons([0,1.5, "food", "Marina Cafe"], cons([0,0, "food", "Buranko"], cons([0,0, "food", "Afuri"], cons([0,0, "food", "Meet Fresh"], cons([0,0, "food", "Montes"], cons([-0.05,-1.4, "food", "Cajun Grill"], cons([1,-1, "food", "Sbarro"], cons([1,1, "food", "Starbucks"], None))))))))
+    assert my_small_town.find_nearby(1,0, "school", 1) == cons([1,1, "school", "DD Scots"], None)
+    assert my_small_town.find_nearby(1,0, "school", 1) == cons([1,1, "school", "DD Scots"], None)
+    assert my_small_town.find_nearby(4,-1, "government", 4) == cons([3,-1, "government", "Park Ranger"], cons([4,-1, "government", "Lighthouse"], None))
+    assert my_small_town.find_nearby(3,-1, "park", 0) == None
+    assert my_small_town.find_nearby(4,-1, "park", 12) == cons([3,-1, "park", "Waterfront Park"], None)
+    assert my_small_town.find_nearby(-0.2,0.7, "health", 3) == cons([0,-1, "health", "Gym"], cons([0,-1, "health", "Hospital"], cons([0.3,0.9, "health", "Dentist"], None)))
+    assert my_small_town.find_nearby(1,-1, "store", 14) == cons([0.3,0.9, "store", "Whole Foods"], cons([-0.2,0.7, "store", "Costco"], cons([0,0, "store", "Target"], None)))
+    assert my_small_town.find_nearby(1,0, "food", 9) == cons([0,1.5, "food", "Marina Cafe"], cons([0,0, "food", "Buranko"], cons([0,0, "food", "Afuri"], cons([0,0, "food", "Meet Fresh"], cons([0,0, "food", "Montes"], cons([-0.05,-1.4, "food", "Cajun Grill"], cons([1,-1, "food", "Sbarro"], cons([1,1, "food", "Starbucks"], None))))))))
+    
+test 'My third locate_all test':
+    assert my_third_example().locate_all("restaurant") == None
+    assert my_third_example().locate_all("information") == cons([9.5, 15], cons([9.5,-15], cons([9.5,0], None)))
+    assert my_third_example().locate_all("camping") == cons([9.5,0], cons([-0.5,-7], cons([-0.5,7], cons([-0.5,0], None))))
+    assert my_third_example().locate_all("hiking") == cons([9.5,15], cons([-0.5,7], cons([9.5,-15], cons([-0.5,-7], None))))
+    assert my_third_example().locate_all("equipment") == cons([9.5,-15], cons([9.5,15], None))
+    
+test 'My third plan_route test':
+    assert my_third_example().plan_route(-0.5,0, "Checkpoint 1") == cons([-0.5,0], cons([-0.5,7], cons([4.5,11], cons([9.5,15], cons([9.5,0], None)))))
+    assert my_third_example().plan_route(-0.5,0, "Map 2") == cons([-0.5,0], cons([-0.5,7], cons([4.5,11], cons([9.5,15], cons([9.5,0], None)))))
+    assert my_third_example().plan_route(-0.5,0, "Camping Shop") == cons([-0.5,0], cons([-0.5,7], cons([4.5,11], cons([9.5,15], None))))
+    assert my_third_example().plan_route(-0.5,0, "Hiking Shop") == cons([-0.5,0], cons([-0.5,-7], cons([4.5,-11], cons([9.5,-15], None))))
+    assert my_third_example().plan_route(-0.5,7, "West Entrance") == cons([-0.5,7], cons([-0.5,0], cons([-0.5,-7], cons([4.5,-11], cons([9.5,-15], None)))))
+    assert my_third_example().plan_route(9.5,0, "Waterfall") == cons([9.5,0], cons([9.5,15], cons([4.5,11], cons([-0.5,7], cons([-0.5,0], None)))))
+    assert my_third_example().plan_route(9.5,0, "West River Trail") == cons([9.5,0], cons([9.5,-15], cons([4.5,-11], cons([-0.5,-7], None))))
+    assert my_third_example().plan_route(9.5,-15, "East River Trail") == cons([9.5,-15], cons([4.5,-11], cons([-0.5,-7], cons([-0.5,0], cons([-0.5,7], None)))))
+    assert my_third_example().plan_route(9.5,15, "West Visitor Center") == cons([9.5,15], cons([9.5,0], cons([9.5,-15], None)))
+    assert my_third_example().plan_route(4.5,-11, "Map 3") == cons([4.5,-11], cons([-0.5,-7], cons([-0.5,0], cons([-0.5,7], cons([4.5,11], cons([9.5,15], None))))))
+    assert my_third_example().plan_route(9.5,15, "Fishery") == None
+    
+test 'My third find_nearby test':
+    let Ainsworth_State_Park = my_third_example()
+    assert Ainsworth_State_Park.find_nearby(-0.5,0, "information", 4) == cons([9.5,15, "information", "Map 3"], cons([9.5,15, "information", "East Visitor Center"], cons([9.5,-15, "information", "Map 1"], cons([9.5,-15, "information", "West Visitor Center"], None))))
+    assert Ainsworth_State_Park.find_nearby(-0.5,0, "information", 4) == cons([9.5,15, "information", "Map 3"], cons([9.5,15, "information", "East Visitor Center"], cons([9.5,-15, "information", "Map 1"], cons([9.5,-15, "information", "West Visitor Center"], None))))
+    assert Ainsworth_State_Park.find_nearby(-0.5,0, "hiking", 5) == cons([9.5,15, "hiking", "East Entrance"], cons([9.5,-15, "hiking", "West Entrance"], cons([-0.5,7, "hiking", "East River Trail"], cons([-0.5,-7, "hiking", "West River Trail"], None))))
+    assert Ainsworth_State_Park.find_nearby(-0.5,0, "equipment", 4) == cons([9.5,15, "equipment", "Camping Shop"], cons([9.5,-15, "equipment", "Hiking Shop"], None))
+    assert Ainsworth_State_Park.find_nearby(-0.5,0, "information" ,3) == cons([9.5,15, "information", "East Visitor Center"], cons([9.5,-15, "information", "Map 1"], cons([9.5,-15, "information", "West Visitor Center"], None)))
+    assert Ainsworth_State_Park.find_nearby(-0.5,0, "information" ,3) == cons([9.5,15, "information", "East Visitor Center"], cons([9.5,-15, "information", "Map 1"], cons([9.5,-15, "information", "West Visitor Center"], None)))
+    assert Ainsworth_State_Park.find_nearby(-0.5,0, "camping", 7) == cons([9.5,0, "camping", "Checkpoint 1"], cons([-0.5,7, "camping", "Checkpoint 3"], cons([-0.5,-7, "camping", "Checkpoint 2"], cons([-0.5,0, "camping", "Checkpoint 4"], None))))
+    assert Ainsworth_State_Park.find_nearby(-0.5,0, "camping", 3) == cons([-0.5,7, "camping", "Checkpoint 3"], cons([-0.5,-7, "camping", "Checkpoint 2"], cons([-0.5,0, "camping", "Checkpoint 4"], None)))
+    assert Ainsworth_State_Park.find_nearby(9.5,0, "camping", 4) == cons([-0.5,0, "camping", "Checkpoint 4"], cons([-0.5,7, "camping", "Checkpoint 3"], cons([-0.5,-7, "camping", "Checkpoint 2"], cons([9.5,0, "camping", "Checkpoint 1"], None))))
+    assert Ainsworth_State_Park.find_nearby(9.5,0, "camping", 4) == cons([-0.5,0, "camping", "Checkpoint 4"], cons([-0.5,7, "camping", "Checkpoint 3"], cons([-0.5,-7, "camping", "Checkpoint 2"], cons([9.5,0, "camping", "Checkpoint 1"], None))))
+    assert Ainsworth_State_Park.find_nearby(9.5,0, "hiking", 3) == cons([-0.5,-7, "hiking", "West River Trail"], cons([9.5,15, "hiking", "East Entrance"], cons([9.5,-15, "hiking", "West Entrance"], None)))
+    assert Ainsworth_State_Park.find_nearby(9.5,0, "equipment", 1) == cons([9.5,-15, "equipment", "Hiking Shop"], None)
+    assert Ainsworth_State_Park.find_nearby(9.5,0, "information", 4) == cons([9.5,15, "information", "East Visitor Center"], cons([9.5,-15, "information", "Map 1"], cons([9.5,-15, "information", "West Visitor Center"], cons([9.5,0, "information", "Map 2"], None))))
+    assert Ainsworth_State_Park.find_nearby(-0.5,-7, "information", 5) == cons([9.5,0, "information", "Map 2"], cons([9.5,15, "information", "Map 3"], cons([9.5,15, "information", "East Visitor Center"], cons([9.5,-15, "information", "Map 1"], cons([9.5,-15, "information", "West Visitor Center"], None)))))
+    assert Ainsworth_State_Park.find_nearby(4.5,11, "hiking", 5) == cons([9.5,-15, "hiking", "West Entrance"], cons([-0.5,-7, "hiking", "West River Trail"], cons([-0.5,7, "hiking", "East River Trail"], cons([9.5,15, "hiking", "East Entrance"], None))))
+    assert Ainsworth_State_Park.find_nearby(4.5,-11, "hiking", 3) == cons([-0.5,7, "hiking", "East River Trail"], cons([-0.5,-7, "hiking", "West River Trail"], cons([9.5,-15, "hiking", "West Entrance"], None)))
+    assert Ainsworth_State_Park.find_nearby(4.5,-11, "hiking", 3) == cons([-0.5,7, "hiking", "East River Trail"], cons([-0.5,-7, "hiking", "West River Trail"], cons([9.5,-15, "hiking", "West Entrance"], None)))
+    assert Ainsworth_State_Park.find_nearby(-0.5,0, "information" ,3) == cons([9.5,15, "information", "East Visitor Center"], cons([9.5,-15, "information", "Map 1"], cons([9.5,-15, "information", "West Visitor Center"], None)))
+    assert Ainsworth_State_Park.find_nearby(-0.5,7, "hiking", 18) == cons([9.5,-15, "hiking", "West Entrance"], cons([-0.5,-7, "hiking", "West River Trail"], cons([9.5,15, "hiking", "East Entrance"], cons([-0.5,7, "hiking", "East River Trail"], None))))
+    assert Ainsworth_State_Park.find_nearby(4.5,-11, "camping", 4) == cons([9.5,0, "camping", "Checkpoint 1"], cons([-0.5,7, "camping", "Checkpoint 3"], cons([-0.5,0, "camping", "Checkpoint 4"], cons([-0.5,-7, "camping", "Checkpoint 2"], None))))
+    assert Ainsworth_State_Park.find_nearby(9.5,0, "camping", 4) == cons([-0.5,0, "camping", "Checkpoint 4"], cons([-0.5,7, "camping", "Checkpoint 3"], cons([-0.5,-7, "camping", "Checkpoint 2"], cons([9.5,0, "camping", "Checkpoint 1"], None))))
+    assert Ainsworth_State_Park.find_nearby(-0.5,-7, "scenic point", 3) == cons([9.5,0, "scenic point", "Vista House"], None)
+    assert Ainsworth_State_Park.find_nearby(4.5,-11, "hiking", 3) == cons([-0.5,7, "hiking", "East River Trail"], cons([-0.5,-7, "hiking", "West River Trail"], cons([9.5,-15, "hiking", "West Entrance"], None)))
+    assert Ainsworth_State_Park.find_nearby(4.5,-11, "hiking", 3) == cons([-0.5,7, "hiking", "East River Trail"], cons([-0.5,-7, "hiking", "West River Trail"], cons([9.5,-15, "hiking", "West Entrance"], None)))
+    assert Ainsworth_State_Park.find_nearby(9.5,15, "fishing", 1) == cons([-0.5,0, "fishing", "Waterfall"], None)
+    assert Ainsworth_State_Park.find_nearby(-0.5,0, "hiking", 0) == None
+    assert Ainsworth_State_Park.find_nearby(9.5,0, "Map 2", 25) == None
